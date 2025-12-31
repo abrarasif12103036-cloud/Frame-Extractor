@@ -68,6 +68,72 @@ showThumbsBtn.addEventListener('click', () => {
   renderThumbnails()
 })
 
+document.getElementById('demo').addEventListener('click', () => {
+  setStatus('Requesting demo from server...')
+  updateProgress(0)
+  const xhr = new XMLHttpRequest()
+  xhr.open('POST', 'http://127.0.0.1:5000/demo')
+  xhr.responseType = 'blob'
+  xhr.onload = async () => {
+    updateProgress(100)
+    if (xhr.status >= 200 && xhr.status < 300) {
+      const detector = xhr.getResponseHeader('X-Used-Detector') || 'unknown'
+      const markers = xhr.getResponseHeader('X-Markers-Count') || '0'
+      const frames = xhr.getResponseHeader('X-Frames-Count') || '0'
+      setStatus(`Demo completed — detector: ${detector}, markers: ${markers}`)
+      lastZipBlob = xhr.response
+      const url = window.URL.createObjectURL(lastZipBlob)
+      downloadLink.href = url
+      downloadLink.classList.remove('d-none')
+
+      // Try to extract preview thumbnails if possible
+      try {
+        const jszip = new JSZip()
+        const zip = await jszip.loadAsync(lastZipBlob)
+        thumbnails = []
+        for (const fname of Object.keys(zip.files)) {
+          const lower = fname.toLowerCase()
+          if (lower.endsWith('.jpg') || lower.endsWith('.jpeg') || lower.endsWith('.png') || lower.endsWith('.webp')) {
+            thumbnails.push(fname)
+          }
+        }
+        const serverFrames = parseInt(frames, 10) || 0
+        frameCount.textContent = `${serverFrames} frames (preview ${thumbnails.length})`
+        if (thumbnails.length > 0) {
+          showThumbsBtn.classList.remove('d-none')
+          // preload first few
+          thumbGrid.innerHTML = ''
+          const toShow = thumbnails.slice(0, 8)
+          for (const name of toShow) {
+            const entry = zip.files[name]
+            const blob = await entry.async('blob')
+            const imgUrl = URL.createObjectURL(blob)
+            const col = document.createElement('div')
+            col.className = 'col-6 col-md-4'
+            const img = document.createElement('img')
+            img.src = imgUrl
+            img.alt = name
+            col.appendChild(img)
+            thumbGrid.appendChild(col)
+          }
+          setStatus(`Frames ready — detector: ${detector}, markers: ${markers} — click "Show thumbnails" for full grid`)
+        } else if (serverFrames > 0) {
+          setStatus(`Frames ZIP received: ${serverFrames} frames, but no image previews found (you can still download frames.zip)`)
+        } else {
+          setStatus('Demo completed but no frames in ZIP')
+        }
+      } catch (err) {
+        setStatus('Demo completed but error reading ZIP: ' + err.message)
+      }
+
+    } else {
+      setStatus('Demo failed: ' + xhr.statusText)
+    }
+  }
+  xhr.onerror = () => setStatus('Network error during demo request')
+  xhr.send()
+})
+
 uploadBtn.addEventListener('click', () => {
   if (!currentFile) { setStatus('Choose a video first.'); return }
 
@@ -79,6 +145,13 @@ uploadBtn.addEventListener('click', () => {
   const form = new FormData()
   form.append('video', currentFile)
   form.append('interval', String(intervalVal))
+  const track = document.getElementById('track-red').checked ? '1' : '0'
+  form.append('track_red', track)
+  // Pass detection tuning parameters
+  const minPixels = document.getElementById('min_pixels') ? document.getElementById('min_pixels').value : '80'
+  const redMin = document.getElementById('red_min') ? document.getElementById('red_min').value : '150'
+  form.append('min_pixels', String(minPixels))
+  form.append('red_min', String(redMin))
 
   setStatus('Uploading...')
   updateProgress(0)
@@ -97,8 +170,12 @@ uploadBtn.addEventListener('click', () => {
 
   xhr.onload = async () => {
     updateProgress(100)
+    const detector = xhr.getResponseHeader('X-Used-Detector') || 'unknown'
+    const markers = xhr.getResponseHeader('X-Markers-Count') || '0'
+    const frames = xhr.getResponseHeader('X-Frames-Count') || '0'
+
     if (xhr.status >= 200 && xhr.status < 300) {
-      setStatus('Processing completed — received frames.zip')
+      setStatus(`Processing completed — detector: ${detector}, markers found: ${markers}`)
       lastZipBlob = xhr.response
       const url = window.URL.createObjectURL(lastZipBlob)
       downloadLink.href = url
@@ -111,11 +188,13 @@ uploadBtn.addEventListener('click', () => {
         const zip = await jszip.loadAsync(lastZipBlob)
         thumbnails = []
         for (const fname of Object.keys(zip.files)) {
-          if (fname.toLowerCase().endsWith('.jpg') || fname.toLowerCase().endsWith('.png')) {
+          const lower = fname.toLowerCase()
+          if (lower.endsWith('.jpg') || lower.endsWith('.jpeg') || lower.endsWith('.png') || lower.endsWith('.webp')) {
             thumbnails.push(fname)
           }
         }
-        frameCount.textContent = `${thumbnails.length} frames`
+        const serverFrames = parseInt(frames, 10) || 0
+        frameCount.textContent = `${serverFrames} frames (preview ${thumbnails.length})`
         if (thumbnails.length > 0) {
           showThumbsBtn.classList.remove('d-none')
           // Preload up to first 8 thumbnails to show immediately
@@ -133,9 +212,25 @@ uploadBtn.addEventListener('click', () => {
             col.appendChild(img)
             thumbGrid.appendChild(col)
           }
-          setStatus('Frames ready — click "Show thumbnails" for full grid')
+          setStatus(`Frames ready — detector: ${detector}, markers: ${markers} — click "Show thumbnails" for full grid`)
+        } else if (serverFrames > 0) {
+          setStatus(`Frames ZIP received: ${serverFrames} frames, but no image previews found (you can still download frames.zip)`)
+          showThumbsBtn.classList.add('d-none')
         } else {
           setStatus('No frames found in ZIP')
+        }
+
+        // If server included detections.json, show a small summary
+        if (zip.files['detections.json']) {
+          try {
+            const txt = await zip.files['detections.json'].async('string')
+            const det = JSON.parse(txt)
+            const keys = Object.keys(det).slice(0, 6)
+            const lines = keys.map(k => `${k}: ${JSON.stringify(det[k])}`)
+            setStatus((serverFrames || thumbnails.length) + ' frames — detector: ' + detector + ', markers: ' + markers + '\n' + lines.join('\n'))
+          } catch (e) {
+            // ignore
+          }
         }
       } catch (err) {
         setStatus('Error reading ZIP: ' + err.message)

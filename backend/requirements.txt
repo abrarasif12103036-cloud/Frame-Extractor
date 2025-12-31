@@ -3,3 +3,5 @@ python-dotenv
 flask-cors
 pytest
 requests
+pillow
+# Note: opencv-python may not be available for some Python versions (e.g., 3.14 on Windows). If you want red-tracking, install opencv-python manually.

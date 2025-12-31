@@ -31,8 +31,23 @@
               <input id="interval" type="number" min="0.01" max="5.0" step="0.01" value="0.1" class="form-control w-auto">
               <span class="input-group-text">seconds</span>
             </div>
+            <div class="form-check form-switch mb-2">
+              <input class="form-check-input" type="checkbox" id="track-red">
+              <label class="form-check-label" for="track-red">Track red dot</label>
+            </div>
+            <div class="row g-2 mb-2">
+              <div class="col-sm-6">
+                <label for="min_pixels" class="form-label small">Min pixels (detection sensitivity)</label>
+                <input id="min_pixels" type="number" min="1" max="5000" value="80" class="form-control form-control-sm">
+              </div>
+              <div class="col-sm-6">
+                <label for="red_min" class="form-label small">Red intensity threshold</label>
+                <input id="red_min" type="number" min="0" max="255" value="150" class="form-control form-control-sm">
+              </div>
+            </div>
             <div class="d-grid gap-2">
               <button id="upload" class="btn btn-success btn-lg" disabled>Upload & Extract</button>
+              <button id="demo" class="btn btn-outline-primary mt-2">Demo red-tracking</button>
             </div>
           </div>
 
