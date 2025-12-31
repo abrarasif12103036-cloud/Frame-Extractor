@@ -15,9 +15,33 @@ CORS(app)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+import sys
+
+
+def find_ffmpeg():
+    """Return path to ffmpeg binary if available, prefer system ffmpeg, then bundled or tools copy."""
+    candidate = shutil.which('ffmpeg')
+    if candidate:
+        return candidate
+    meipass = getattr(sys, '_MEIPASS', None)
+    if meipass:
+        p = os.path.join(meipass, 'tools', 'ffmpeg', 'ffmpeg.exe')
+        if os.path.exists(p):
+            return p
+    # fallback to the tools folder next to the repo (useful during development)
+    candidate2 = os.path.join(os.path.dirname(__file__), '..', 'tools', 'ffmpeg-8.0.1-essentials_build', 'bin', 'ffmpeg.exe')
+    if os.path.exists(candidate2):
+        return candidate2
+    return None
+
 # Config
-UPLOAD_DIR = os.path.join(os.path.dirname(__file__), 'uploads')
-FRAMES_DIR = os.path.join(os.path.dirname(__file__), 'frames')
+import sys
+
+# When packaged by PyInstaller, resources are extracted to _MEIPASS; otherwise use module dir
+_base_dir = getattr(sys, "_MEIPASS", os.path.dirname(__file__))
+UPLOAD_DIR = os.path.join(_base_dir, 'uploads')
+FRAMES_DIR = os.path.join(_base_dir, 'frames')
+# Ensure directories exist (works both packaged and during development)
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(FRAMES_DIR, exist_ok=True)
 
@@ -33,8 +57,11 @@ def handle_file_too_large(e):
 @app.route('/info')
 def info():
     """Return ffmpeg version info if available."""
+    ffmpeg_exe = find_ffmpeg()
+    if not ffmpeg_exe:
+        return jsonify({'ffmpeg': None, 'error': 'ffmpeg not found'}), 500
     try:
-        res = subprocess.run(['ffmpeg', '-version'], check=True, capture_output=True, text=True)
+        res = subprocess.run([ffmpeg_exe, '-version'], check=True, capture_output=True, text=True)
         return jsonify({'ffmpeg': res.stdout.splitlines()[0]})
     except Exception as e:
         return jsonify({'ffmpeg': None, 'error': str(e)}), 500
@@ -44,40 +71,146 @@ def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
 
-# Helper: Pillow-based robust centroid detection (connected-component based)
-def detect_red_pillow_coords(img_p, red_min=150, score_min=15, min_pixels=80):
-    """Return (cx, cy, pixels_in_component, confidence) or (None, None, count, 0.0)
-    Uses simple connected-component grouping on pixels that pass red thresholds.
+# Helper: color parsing and detection helpers
+import colorsys
+
+NAMED_COLORS = {
+    'red': (255, 0, 0),
+    'green': (0, 255, 0),
+    'blue': (0, 0, 255),
+    'yellow': (255, 255, 0),
+    'cyan': (0, 255, 255),
+    'magenta': (255, 0, 255),
+    'white': (255, 255, 255),
+    'black': (0, 0, 0),
+}
+
+def parse_color_string(s):
+    """Parse a color spec (name, #rgb, #rrggbb, or 'r,g,b') into an (R,G,B) tuple 0-255.
+    Returns None on failure.
+    """
+    if not s:
+        return None
+    s = str(s).strip().lower()
+    if s in NAMED_COLORS:
+        return NAMED_COLORS[s]
+    if s.startswith('#'):
+        hexs = s[1:]
+        if len(hexs) == 3:
+            hexs = ''.join(ch*2 for ch in hexs)
+        if len(hexs) == 6:
+            try:
+                r = int(hexs[0:2], 16)
+                g = int(hexs[2:4], 16)
+                b = int(hexs[4:6], 16)
+                return (r, g, b)
+            except Exception:
+                return None
+    if ',' in s:
+        parts = [p.strip() for p in s.split(',')]
+        if len(parts) == 3:
+            try:
+                r, g, b = [int(p) for p in parts]
+                if all(0 <= v <= 255 for v in (r, g, b)):
+                    return (r, g, b)
+            except Exception:
+                return None
+    return None
+
+
+def rgb_to_hsv_cv(rgb):
+    """Convert (R,G,B) 0-255 to OpenCV-style HSV (H:0-179, S,V:0-255)
+    Returns (h, s, v) ints.
+    """
+    r, g, b = rgb
+    # colorsys uses 0..1 and H 0..1
+    h, s, v = colorsys.rgb_to_hsv(r/255.0, g/255.0, b/255.0)
+    return int(h * 179), int(s * 255), int(v * 255)
+
+
+def hsv_ranges_for_rgb(rgb, dh=12, ds=80, dv=80):
+    """Return a list of (lower, upper) HSV ranges suitable for cv2.inRange
+    Handles hue wrap-around for colors near 0 (red).
+    Each lower/upper is (H,S,V) with H in 0..179, S/V in 0..255.
+    """
+    h, s, v = rgb_to_hsv_cv(rgb)
+    lower_h = max(0, h - dh)
+    upper_h = min(179, h + dh)
+    lower = (lower_h, max(30, s - ds), max(30, v - dv))
+    upper = (upper_h, min(255, s + ds), min(255, v + dv))
+    if lower_h == 0 and h - dh < 0:
+        # wrap: produce two ranges
+        wrap_low = (179 + (h - dh) + 1, lower[1], lower[2])
+        wrap_high = (179, upper[1], upper[2])
+        return [(lower, upper), ((0, lower[1], lower[2]), (upper_h, upper[1], upper[2]))]
+    # if hue near 179-handled by default single range
+    return [(lower, upper)]
+
+
+def detect_color_pillow_coords(img_p, target_rgb=(255, 0, 0), tol=80, min_pixels=80):
+    """Return (cx, cy, pixels_in_component, confidence) or (None, None, count, 0.0).
+    Uses connected components on pixels whose Euclidean RGB distance to target <= tol.
     """
     w, h = img_p.size
     pixels = img_p.load()
-    red_pixels = []
-    best_score = 0
+    matched = []
+    best_score = None
     best_xy = None
+    t_r, t_g, t_b = target_rgb
+    tol2 = tol * tol
     for y in range(h):
         for x in range(w):
             r, g, b = pixels[x, y]
-            score = r - max(g, b)
-            if r > red_min and score > score_min:
-                red_pixels.append((x, y))
-            if score > best_score:
-                best_score = score
+            dr = r - t_r
+            dg = g - t_g
+            db = b - t_b
+            dist2 = dr*dr + dg*dg + db*db
+            if dist2 <= tol2:
+                matched.append((x, y))
+            if best_score is None or dist2 < best_score:
+                best_score = dist2
                 best_xy = (x, y)
-    total_candidates = len(red_pixels)
-    # Not enough pixels: fallback to strong single-pixel signal
+    total_candidates = len(matched)
     if total_candidates < min_pixels:
-        if best_xy and best_score > (score_min + 15):
-            return float(best_xy[0]), float(best_xy[1]), total_candidates, float(best_score)
+        # fallback to best single pixel if it's close enough
+        if best_xy and best_score is not None and best_score <= (tol2 / 4):
+            return float(best_xy[0]), float(best_xy[1]), total_candidates, float(max(0.0, 1.0 - best_score / (tol2 or 1)))
         return None, None, total_candidates, 0.0
 
     # Connected components (8-neighborhood)
-    red_set = set(red_pixels)
+    matched_set = set(matched)
     visited = set()
     components = []
     neighs = [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (-1, 1), (1, -1), (1, 1)]
-    for px, py in red_pixels:
+    for px, py in matched:
         if (px, py) in visited:
             continue
+        # BFS/DFS to collect component
+        stack = [(px, py)]
+        comp = []
+        visited.add((px, py))
+        while stack:
+            cx0, cy0 = stack.pop()
+            comp.append((cx0, cy0))
+            for dx, dy in neighs:
+                nx, ny = cx0 + dx, cy0 + dy
+                if (nx, ny) in matched_set and (nx, ny) not in visited:
+                    visited.add((nx, ny))
+                    stack.append((nx, ny))
+        components.append(comp)
+
+    best_comp = max(components, key=len)
+    xs = [p[0] for p in best_comp]
+    ys = [p[1] for p in best_comp]
+    cx = float(sum(xs) / len(xs))
+    cy = float(sum(ys) / len(ys))
+    confidence = float(len(best_comp)) / float(total_candidates or 1)
+    return cx, cy, len(best_comp), confidence
+
+# (old detect_red_pillow_coords kept for compatibility)
+def detect_red_pillow_coords(img_p, red_min=150, score_min=15, min_pixels=80):
+    return detect_color_pillow_coords(img_p, target_rgb=(255, 0, 0), tol=100, min_pixels=min_pixels)
+
         stack = [(px, py)]
         comp = []
         visited.add((px, py))
@@ -161,21 +294,29 @@ def upload_video():
         # Use ffmpeg to extract frames at desired fps (1 / interval seconds)
         out_pattern = os.path.join(temp_frames, 'frame_%05d.jpg')
         fps_filter = f"fps={fps:.6f}"
-        cmd = ['ffmpeg', '-y', '-i', input_path, '-vf', fps_filter, out_pattern]
+        ffmpeg_exe = find_ffmpeg()
+        if not ffmpeg_exe:
+            return jsonify({'error': 'ffmpeg not available on server'}), 500
+        cmd = [ffmpeg_exe, '-y', '-i', input_path, '-vf', fps_filter, out_pattern]
         try:
             logger.info('Running ffmpeg with interval=%s (fps=%s): %s', interval, fps, ' '.join(cmd))
             subprocess.run(cmd, check=True, capture_output=True, text=True)
-        except FileNotFoundError:
-            return jsonify({'error': 'ffmpeg not available on server'}), 500
         except subprocess.CalledProcessError as e:
             # include ffmpeg stderr for debugging
             return jsonify({'error': 'ffmpeg failed', 'detail': e.stderr}), 500
 
-        # Optionally perform red-dot tracking and mark centers on frames
-        track_red = request.form.get('track_red', '0').lower() in ('1', 'true', 'yes', 'on')
+        # Optionally perform color-dot tracking and mark centers on frames
+        # Backwards-compatible support: if track_red is set, default to 'red'.
+        track_color = request.form.get('track_color') or ( 'red' if request.form.get('track_red', '0').lower() in ('1','true','yes','on') else None )
         used_detector = 'none'
         markers_count = 0
         detections = {}
+        # Parse color (supports named colors, #rrggbb, and 'r,g,b')
+        target_rgb = parse_color_string(track_color) if track_color else None
+        # allow override of detection params
+        min_pixels = int(request.form.get('min_pixels', 80))
+        tol = int(request.form.get('color_tol', 80))
+
         min_pixels_req = int(request.form.get('min_pixels', 40))
         if track_red:
             # Try OpenCV-based detection first (more robust); if not available, use Pillow fallback
@@ -382,7 +523,9 @@ def upload_video():
 
 @app.route('/demo', methods=['POST', 'GET'])
 def demo():
-    # Create a short test video (1s) with a moving red square, run processing, and return frames.zip
+    # Create a short test video (1s) with a moving colored square (color from query), run processing, and return frames.zip
+    color_param = request.args.get('color') or request.args.get('track_color') or 'red'
+    target_rgb = parse_color_string(color_param) or (255, 0, 0)
     with tempfile.TemporaryDirectory(dir=FRAMES_DIR) as tmpd:
         video_path = os.path.join(tmpd, 'demo.mp4')
         # Generate frames and encode with ffmpeg
@@ -400,9 +543,12 @@ def demo():
             draw = ImageDraw.Draw(img)
             x = int((w - 8) * (i / max(1, frames - 1)))
             y = 50
-            draw.rectangle((x, y, x + 8, y + 8), fill=(255, 0, 0))
+            draw.rectangle((x, y, x + 8, y + 8), fill=target_rgb)
             img.save(os.path.join(png_dir, f'frame_{i:03d}.png'))
-        cmd = ['ffmpeg', '-y', '-framerate', str(fps), '-i', os.path.join(png_dir, 'frame_%03d.png'), '-c:v', 'libx264', '-pix_fmt', 'yuv420p', video_path]
+        ffmpeg_exe = find_ffmpeg()
+        if not ffmpeg_exe:
+            return jsonify({'error': 'ffmpeg not available', 'detail': 'ffmpeg binary not found'}), 500
+        cmd = [ffmpeg_exe, '-y', '-framerate', str(fps), '-i', os.path.join(png_dir, 'frame_%03d.png'), '-c:v', 'libx264', '-pix_fmt', 'yuv420p', video_path]
         try:
             subprocess.run(cmd, check=True, capture_output=True)
         except subprocess.CalledProcessError as e:
@@ -411,7 +557,7 @@ def demo():
         # Now extract frames and run tracking (reuse logic)
         out_pattern = os.path.join(tmpd, 'frame_%05d.jpg')
         try:
-            subprocess.run(['ffmpeg', '-y', '-i', video_path, '-vf', 'fps=10', out_pattern], check=True, capture_output=True)
+            subprocess.run([ffmpeg_exe, '-y', '-i', video_path, '-vf', 'fps=10', out_pattern], check=True, capture_output=True)
         except subprocess.CalledProcessError as e:
             return jsonify({'error': 'ffmpeg failed', 'detail': e.stderr.decode(errors='replace')}), 500
 
@@ -428,19 +574,24 @@ def demo():
             if not fname.lower().endswith(('.jpg', '.jpeg', '.png')):
                 continue
             path = os.path.join(tmpd, fname)
-            if use_cv:
+            if use_cv and target_rgb is not None:
                 used_detector = 'opencv'
                 img = cv2.imread(path)
                 if img is None:
                     continue
                 hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-                lower1 = np.array([0, 100, 50])
-                upper1 = np.array([10, 255, 255])
-                lower2 = np.array([160, 100, 50])
-                upper2 = np.array([179, 255, 255])
-                mask1 = cv2.inRange(hsv, lower1, upper1)
-                mask2 = cv2.inRange(hsv, lower2, upper2)
-                mask = cv2.bitwise_or(mask1, mask2)
+                ranges = hsv_ranges_for_rgb(target_rgb)
+                mask = None
+                for (low, high) in ranges:
+                    low_arr = np.array(low, dtype=np.uint8)
+                    high_arr = np.array(high, dtype=np.uint8)
+                    m = cv2.inRange(hsv, low_arr, high_arr)
+                    if mask is None:
+                        mask = m
+                    else:
+                        mask = cv2.bitwise_or(mask, m)
+                if mask is None:
+                    continue
                 kernel = np.ones((3, 3), np.uint8)
                 mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
                 contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -455,6 +606,20 @@ def demo():
                         cv2.putText(img, f"({cx},{cy})", (cx + 8, cy - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
                         cv2.imwrite(path, img)
                         markers_count += 1
+            elif target_rgb is not None:
+                used_detector = 'pillow'
+                from PIL import Image, ImageDraw
+                img_p = Image.open(path).convert('RGB')
+                cx, cy, count, conf = detect_color_pillow_coords(img_p, target_rgb=target_rgb, tol=tol, min_pixels=min_pixels)
+                if cx is not None and cy is not None:
+                    draw = ImageDraw.Draw(img_p)
+                    radius = 6
+                    draw.ellipse((cx - radius, cy - radius, cx + radius, cy + radius), outline=(0, 255, 0), width=2)
+                    draw.line((cx - 8, cy, cx + 8, cy), fill=(0, 255, 0), width=1)
+                    draw.line((cx, cy - 8, cx, cy + 8), fill=(0, 255, 0), width=1)
+                    draw.text((cx + 8, cy - 12), f"({int(cx)},{int(cy)})", fill=(0, 255, 0))
+                    img_p.save(path)
+                    markers_count += 1
             else:
                 used_detector = 'pillow'
                 from PIL import Image, ImageDraw
@@ -505,7 +670,8 @@ def demo():
         headers = {
             'X-Frames-Count': str(frames_count),
             'X-Markers-Count': str(markers_count),
-            'X-Used-Detector': used_detector
+            'X-Used-Detector': used_detector,
+            'X-Track-Color': (track_color or '')
         }
         resp = send_file(zip_path, as_attachment=True)
         resp.headers.update(headers)
