@@ -1,0 +1,5 @@
+Flask>=2.0
+python-dotenv
+flask-cors
+pytest
+requests

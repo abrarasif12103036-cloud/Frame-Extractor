@@ -1,0 +1,7 @@
+body { font-family: Inter, system-ui, -apple-system, "Segoe UI", Roboto, 'Helvetica Neue', Arial; }
+#drop-area { border: 2px dashed #dee2e6; cursor: pointer; background: linear-gradient(180deg, #fff, #f8f9fa); }
+#drop-area.dragover { border-color: #0d6efd; background: linear-gradient(180deg, #f8fbff, #f1f8ff); }
+#thumb-grid img { width: 100%; height: auto; border-radius: 4px; }
+.progress-sm .progress-bar { font-weight: 600; }
+.card { box-shadow: 0 6px 18px rgba(0,0,0,0.04); }
+#status { min-height: 24px; }

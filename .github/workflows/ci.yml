@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: Install dependencies
+        run: python -m pip install --upgrade pip && pip install -r backend/requirements.txt
+
+      - name: Run unit tests
+        run: python -m pytest backend -q
+
+      - name: Start Flask server
+        env:
+          FLASK_APP: backend.app
+        run: |
+          nohup python -m flask run --port 5000 &
+          # wait until the server is ready
+          for i in {1..15}; do
+            if nc -z 127.0.0.1 5000; then
+              echo "server up"
+              break
+            fi
+            sleep 1
+          done
+
+      - name: Run e2e test
+        run: python backend/tests/test_e2e.py
