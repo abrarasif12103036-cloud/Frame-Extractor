@@ -9,7 +9,9 @@ from werkzeug.utils import secure_filename
 from werkzeug.exceptions import RequestEntityTooLarge
 from flask_cors import CORS
 
-app = Flask(__name__)
+# Serve frontend from parent directory
+frontend_path = os.path.join(os.path.dirname(__file__), '..', 'frontend')
+app = Flask(__name__, static_folder=frontend_path, static_url_path='')
 CORS(app)
 
 logging.basicConfig(level=logging.INFO)
@@ -72,7 +74,6 @@ def allowed_file(filename):
 
 
 # Helper: color parsing and detection helpers
-import colorsys
 
 NAMED_COLORS = {
     'red': (255, 0, 0),
@@ -86,7 +87,7 @@ NAMED_COLORS = {
 }
 
 def parse_color_string(s):
-    """Parse a color spec (name, #rgb, #rrggbb, or 'r,g,b') into an (R,G,B) tuple 0-255.
+    """Parse a color spec (name, #rgb, #rrggbb, rgb, rrggbb, or 'r,g,b') into an (R,G,B) tuple 0-255.
     Returns None on failure.
     """
     if not s:
@@ -94,8 +95,10 @@ def parse_color_string(s):
     s = str(s).strip().lower()
     if s in NAMED_COLORS:
         return NAMED_COLORS[s]
-    if s.startswith('#'):
-        hexs = s[1:]
+    
+    # Handle hex with or without # prefix
+    hexs = s.lstrip('#')
+    if len(hexs) in (3, 6) and all(c in '0123456789abcdef' for c in hexs):
         if len(hexs) == 3:
             hexs = ''.join(ch*2 for ch in hexs)
         if len(hexs) == 6:
@@ -106,6 +109,7 @@ def parse_color_string(s):
                 return (r, g, b)
             except Exception:
                 return None
+    
     if ',' in s:
         parts = [p.strip() for p in s.split(',')]
         if len(parts) == 3:
@@ -118,145 +122,602 @@ def parse_color_string(s):
     return None
 
 
-def rgb_to_hsv_cv(rgb):
-    """Convert (R,G,B) 0-255 to OpenCV-style HSV (H:0-179, S,V:0-255)
-    Returns (h, s, v) ints.
+def detect_color_simple_effective(img, target_rgb, color_tolerance=20, min_pixels=80):
+    """SIMPLE BUT EFFECTIVE color detection using direct RGB matching with morphology.
+    Fast and reliable for most use cases.
+    Uses STRICT color matching for eyedropper-sampled colors.
+    Returns (cx, cy, pixel_count, confidence) or (None, None, 0, 0.0).
     """
-    r, g, b = rgb
-    # colorsys uses 0..1 and H 0..1
-    h, s, v = colorsys.rgb_to_hsv(r/255.0, g/255.0, b/255.0)
-    return int(h * 179), int(s * 255), int(v * 255)
+    import cv2
+    import numpy as np
+    
+    h, w = img.shape[:2]
+    
+    # Extract target color in BGR
+    target_b, target_g, target_r = target_rgb[2], target_rgb[1], target_rgb[0]
+    
+    # Create mask: pixels within tolerance of target color
+    # Calculate difference for each channel
+    img_f = img.astype(np.float32)
+    target_f = np.array([[[target_b, target_g, target_r]]], dtype=np.float32)
+    
+    # Euclidean distance in BGR space
+    diff = img_f - target_f
+    distance = np.sqrt(np.sum(diff ** 2, axis=2))
+    
+    # STRICT threshold mapping - much stricter than before!
+    # These values are for eyedropper-picked colors from actual video
+    # tolerance 10 -> threshold ~20 (very strict)
+    # tolerance 20 -> threshold ~35 (strict - default)
+    # tolerance 30 -> threshold ~50 (moderate-strict)
+    if color_tolerance <= 10:
+        threshold = 20
+    elif color_tolerance <= 15:
+        threshold = 25
+    elif color_tolerance <= 20:
+        threshold = 35
+    elif color_tolerance <= 25:
+        threshold = 45
+    elif color_tolerance <= 30:
+        threshold = 55
+    else:
+        threshold = 70
+    
+    # Create binary mask
+    mask = (distance <= threshold).astype(np.uint8) * 255
+    
+    # Morphological operations to clean up
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+    
+    # Find contours
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    if not contours:
+        logger.info(f'Simple detection: No contours found (tolerance={color_tolerance}, threshold={threshold})')
+        return None, None, 0, 0.0
+    
+    # Find largest contour
+    largest_contour = max(contours, key=cv2.contourArea)
+    area = cv2.contourArea(largest_contour)
+    
+    if area < min_pixels:
+        logger.info(f'Simple detection: Area {area} < min_pixels {min_pixels}')
+        return None, None, 0, 0.0
+    
+    # Calculate centroid
+    M = cv2.moments(largest_contour)
+    if M['m00'] <= 0:
+        return None, None, 0, 0.0
+    
+    cx = M['m10'] / M['m00']
+    cy = M['m01'] / M['m00']
+    
+    # Confidence: based on area
+    max_area = h * w
+    confidence = min(0.95, max(0.5, area / (max_area * 0.1)))
+    
+    # Flip Y-axis: Y extends upward from bottom
+    cy = h - cy
+    
+    logger.info(f'Simple detection: centroid=({cx:.1f},{cy:.1f}), area={area}, threshold={threshold}, confidence={confidence:.3f}')
+    
+    return float(cx), float(cy), int(area), float(confidence)
 
 
-def hsv_ranges_for_rgb(rgb, dh=12, ds=80, dv=80):
-    """Return a list of (lower, upper) HSV ranges suitable for cv2.inRange
-    Handles hue wrap-around for colors near 0 (red).
-    Each lower/upper is (H,S,V) with H in 0..179, S/V in 0..255.
+def detect_color_ultimate_accuracy(img, target_rgb, color_tolerance=20, min_pixels=80):
+    """ULTIMATE ACCURACY color detection using hybrid multi-space approach.
+    Combines Lab, HSV, RGB spaces + spatial coherence + adaptive tolerance.
+    Returns (cx, cy, pixel_count, confidence) or (None, None, 0, 0.0).
     """
-    h, s, v = rgb_to_hsv_cv(rgb)
-    lower_h = max(0, h - dh)
-    upper_h = min(179, h + dh)
-    lower = (lower_h, max(30, s - ds), max(30, v - dv))
-    upper = (upper_h, min(255, s + ds), min(255, v + dv))
-    if lower_h == 0 and h - dh < 0:
-        # wrap: produce two ranges
-        wrap_low = (179 + (h - dh) + 1, lower[1], lower[2])
-        wrap_high = (179, upper[1], upper[2])
-        return [(lower, upper), ((0, lower[1], lower[2]), (upper_h, upper[1], upper[2]))]
-    # if hue near 179-handled by default single range
-    return [(lower, upper)]
+    import cv2
+    import numpy as np
+    
+    h, w = img.shape[:2]
+    
+    # STAGE 1: Multi-space color matching
+    # Lab space (perceptually uniform)
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+    target_bgr = np.uint8([[[target_rgb[2], target_rgb[1], target_rgb[0]]]])
+    target_lab = cv2.cvtColor(target_bgr, cv2.COLOR_BGR2LAB)[0, 0]
+    target_l = int(target_lab[0])
+    target_a = int(target_lab[1])
+    target_b = int(target_lab[2])
+    
+    # HSV space (hue-based)
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    target_hsv = cv2.cvtColor(target_bgr, cv2.COLOR_BGR2HSV)[0, 0]
+    target_h = int(target_hsv[0])
+    target_s = int(target_hsv[1])
+    target_v = int(target_hsv[2])
+    
+    # Compute Lab delta ranges
+    if color_tolerance <= 10:
+        dl, da, db = 8, 10, 10
+    elif color_tolerance <= 20:
+        dl, da, db = 10, 12, 12
+    elif color_tolerance <= 30:
+        dl, da, db = 12, 15, 15
+    else:
+        dl, da, db = 15, 18, 18
+    
+    # Lab mask: strict color matching
+    lab_lower = np.array([max(0, target_l - dl), max(0, target_a - da), max(0, target_b - db)], dtype=np.uint8)
+    lab_upper = np.array([min(255, target_l + dl), min(255, target_a + da), min(255, target_b + db)], dtype=np.uint8)
+    lab_mask = cv2.inRange(lab, lab_lower, lab_upper)
+    
+    # HSV mask: hue-based matching (more robust to lighting)
+    # Hue wraps around (0-180 in OpenCV), saturation and value are more lenient
+    hue_range = max(15, int(color_tolerance * 0.8))
+    h_lower = max(0, target_h - hue_range)
+    h_upper = min(180, target_h + hue_range)
+    s_lower = max(0, target_s - 50)
+    s_upper = min(255, target_s + 50)
+    v_lower = max(0, target_v - 60)
+    v_upper = min(255, target_v + 60)
+    
+    hsv_mask = cv2.inRange(hsv, np.array([h_lower, s_lower, v_lower], dtype=np.uint8), 
+                                np.array([h_upper, s_upper, v_upper], dtype=np.uint8))
+    
+    # STAGE 2: Use Lab mask primarily, supplement with HSV
+    # For high tolerance, use OR; for strict tolerance, use AND
+    if color_tolerance <= 15:
+        combined_mask = cv2.bitwise_and(lab_mask, hsv_mask)
+    else:
+        # More lenient: accept colors that match either Lab or HSV
+        combined_mask = cv2.bitwise_or(lab_mask, hsv_mask)
+    
+    # STAGE 3: Morphological refinement
+    kernel_small = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    
+    # Denoise: remove noise and fill small holes
+    combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_OPEN, kernel_small, iterations=1)
+    combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_CLOSE, kernel_small, iterations=1)
+    combined_mask = cv2.dilate(combined_mask, kernel_small, iterations=1)
+    
+    # STAGE 4: Find contours
+    contours, _ = cv2.findContours(combined_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    if not contours:
+        logger.info(f'Ultimate accuracy: No contours found (Lab range: L[{target_l}]±{dl}, a[{target_a}]±{da}, b[{target_b}]±{db})')
+        return None, None, 0, 0.0
+    
+    # STAGE 5: Multi-criteria validation
+    valid_contours = []
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area < min_pixels:
+            continue
+        
+        # Circularity check (reject artifacts)
+        perimeter = cv2.arcLength(cnt, True)
+        if perimeter > 0:
+            circularity = 4 * np.pi * area / (perimeter ** 2)
+            if circularity < 0.15:
+                continue
+        
+        # Fit ellipse for shape analysis
+        if len(cnt) >= 5:
+            try:
+                ellipse = cv2.fitEllipse(cnt)
+                major_axis = max(ellipse[1])
+                minor_axis = min(ellipse[1])
+                if minor_axis > 0:
+                    eccentricity = major_axis / minor_axis
+                    # Reject highly elongated shapes
+                    if eccentricity > 4.0:
+                        continue
+            except:
+                pass
+        
+        valid_contours.append((cnt, area))
+    
+    if not valid_contours:
+        logger.info(f'Ultimate accuracy: No valid contours after filtering')
+        return None, None, 0, 0.0
+    
+    # STAGE 6: Select best contour (largest and most central)
+    largest_contour, area = max(valid_contours, key=lambda x: x[1])
+    
+    # STAGE 7: Refine centroid using weighted pixel colors
+    M = cv2.moments(largest_contour)
+    if M['m00'] <= 0:
+        return None, None, 0, 0.0
+    
+    cx = M['m10'] / M['m00']
+    cy = M['m01'] / M['m00']
+    
+    # STAGE 8: Sub-pixel refinement (calculate color-weighted centroid)
+    mask_single = np.zeros((h, w), dtype=np.uint8)
+    cv2.drawContours(mask_single, [largest_contour], 0, 255, -1)
+    
+    # Weight pixels by color similarity score
+    pixel_coords = np.argwhere(mask_single > 0)
+    if len(pixel_coords) > 0:
+        color_scores = np.zeros(len(pixel_coords))
+        for idx, (y, x) in enumerate(pixel_coords):
+            lab_pix = lab[y, x]
+            lab_dist = np.sqrt((lab_pix[0] - target_l)**2 + (lab_pix[1] - target_a)**2 + (lab_pix[2] - target_b)**2)
+            color_scores[idx] = max(0, 1.0 - lab_dist / 100.0)
+        
+        if np.sum(color_scores) > 0:
+            cx = np.sum(pixel_coords[:, 1] * color_scores) / np.sum(color_scores)
+            cy = np.sum(pixel_coords[:, 0] * color_scores) / np.sum(color_scores)
+    
+    # STAGE 9: Calculate confidence (area, position, color uniformity)
+    max_area = h * w
+    area_conf = min(0.95, area / (max_area * 0.15))
+    
+    # Check color uniformity within detected region
+    if len(pixel_coords) > 0:
+        color_scores_mean = np.mean(color_scores) if np.sum(color_scores) > 0 else 0.3
+        color_conf = min(0.95, color_scores_mean)
+    else:
+        color_conf = 0.5
+    
+    confidence = (area_conf * 0.4 + color_conf * 0.6)
+    confidence = max(0.3, min(0.95, confidence))
+    
+    # Flip Y-axis: Y extends upward from bottom
+    cy = h - cy
+    
+    logger.info(f'Ultimate accuracy: centroid=({cx:.1f},{cy:.1f}), area={area}, color_conf={color_conf:.3f}, final_conf={confidence:.3f}')
+    
+    return float(cx), float(cy), int(area), float(confidence)
 
 
-def detect_color_pillow_coords(img_p, target_rgb=(255, 0, 0), tol=80, min_pixels=80):
-    """Return (cx, cy, pixels_in_component, confidence) or (None, None, count, 0.0).
-    Uses connected components on pixels whose Euclidean RGB distance to target <= tol.
+def detect_color_opencv_hsv(img, target_rgb, color_tolerance=20, min_pixels=80):
+    """High-accuracy color detection using Lab color space with strict matching.
+    Uses multi-stage filtering: strict color matching -> morphology -> component validation.
+    Returns (cx, cy, pixel_count, confidence) or (None, None, 0, 0.0).
     """
+    import cv2
+    import numpy as np
+    
+    # Convert image to Lab color space (more perceptually uniform than HSV)
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+    
+    # Convert target RGB to Lab
+    target_bgr = np.uint8([[[target_rgb[2], target_rgb[1], target_rgb[0]]]])
+    target_lab = cv2.cvtColor(target_bgr, cv2.COLOR_BGR2LAB)[0, 0]
+    target_l, target_a, target_b = target_lab
+    
+    # STRICT tolerance mapping for high accuracy
+    # Tolerance 20 gives tighter Lab delta ranges
+    if color_tolerance <= 10:
+        dl, da, db = 8, 12, 12      # Very strict
+    elif color_tolerance <= 20:
+        dl, da, db = 12, 15, 15     # Strict (default)
+    elif color_tolerance <= 30:
+        dl, da, db = 15, 20, 20     # Moderate
+    else:
+        dl, da, db = 20, 25, 25     # Loose
+    
+    # Create Lab range
+    lower = np.array([max(0, target_l - dl), max(0, target_a - da), max(0, target_b - db)], dtype=np.uint8)
+    upper = np.array([min(255, target_l + dl), min(255, target_a + da), min(255, target_b + db)], dtype=np.uint8)
+    
+    logger.info(f'Target RGB: {target_rgb}, Lab: ({target_l}, {target_a}, {target_b})')
+    logger.info(f'Tolerance {color_tolerance}: Lab deltas L±{dl}, a±{da}, b±{db}')
+    logger.info(f'Lab range: [{lower[0]},{lower[1]},{lower[2]}] to [{upper[0]},{upper[1]},{upper[2]}]')
+    
+    # STAGE 1: Color range mask
+    mask = cv2.inRange(lab, lower, upper)
+    
+    # STAGE 2: Advanced morphological operations for high accuracy
+    kernel_small = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    kernel_medium = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    
+    # Remove small noise, close holes, clean edges
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel_small, iterations=1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_small, iterations=1)
+    mask = cv2.dilate(mask, kernel_small, iterations=1)
+    
+    # STAGE 3: Find contours
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    if not contours:
+        logger.info('No contours found')
+        return None, None, 0, 0.0
+    
+    # STAGE 4: Validate and select best contour
+    valid_contours = []
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area < min_pixels:
+            continue
+        
+        # Check shape validity (reject very thin/elongated artifacts)
+        perimeter = cv2.arcLength(cnt, True)
+        if perimeter > 0:
+            # Circularity metric: 4*pi*area / perimeter^2 (1.0 for circle, <0.2 for lines)
+            circularity = 4 * np.pi * area / (perimeter ** 2)
+            if circularity < 0.15:  # Reject very elongated shapes
+                continue
+        
+        valid_contours.append((cnt, area))
+    
+    if not valid_contours:
+        logger.info(f'No valid contours (min_pixels={min_pixels})')
+        return None, None, 0, 0.0
+    
+    # Select largest valid contour
+    largest_contour, area = max(valid_contours, key=lambda x: x[1])
+    
+    # STAGE 5: Calculate centroid with high precision
+    M = cv2.moments(largest_contour)
+    if M['m00'] > 0:
+        cx = M['m10'] / M['m00']
+        cy = M['m01'] / M['m00']
+        
+        # Confidence: based on area
+        h_img, w_img = img.shape[:2]
+        max_area = h_img * w_img
+        confidence = min(0.95, max(0.3, area / (max_area * 0.1)))
+        
+        # Flip Y-axis: Y extends upward from bottom
+        cy = h_img - cy
+        
+        logger.info(f'Detection: centroid=({cx:.1f},{cy:.1f}), area={area}, confidence={confidence:.2f}')
+        return float(cx), float(cy), int(area), float(confidence)
+    
+    return None, None, 0, 0.0
+
+
+def detect_color_multi_threshold_opencv(img, target_rgb, color_tolerance=20, min_pixels=80):
+    """Multi-threshold detection with confidence-weighted centroid averaging.
+    Runs detection at multiple tolerance levels and averages results weighted by confidence.
+    Falls back to iterative tolerance increase if no detection found.
+    Returns (cx, cy, pixel_count, confidence) or (None, None, 0, 0.0).
+    """
+    import cv2
+    import numpy as np
+    
+    logger.info(f'Starting multi-threshold detection for RGB {target_rgb}')
+    
+    # Try three tolerance levels: base-2, base, base+2
+    tolerance_levels = [max(10, color_tolerance - 2), color_tolerance, color_tolerance + 2]
+    detections = []
+    
+    # STAGE 1: Multi-threshold detection
+    for tol in tolerance_levels:
+        cx, cy, area, conf = detect_color_opencv_hsv(img, target_rgb, tol, min_pixels)
+        if cx is not None and conf >= 0.25:
+            detections.append((cx, cy, area, conf))
+            logger.info(f'  Tolerance {tol}: centroid=({cx:.1f},{cy:.1f}), confidence={conf:.2f}')
+    
+    # STAGE 2: If multi-threshold found results, average them
+    if detections:
+        total_conf = sum(d[3] for d in detections)
+        avg_cx = sum(d[0] * d[3] for d in detections) / total_conf
+        avg_cy = sum(d[1] * d[3] for d in detections) / total_conf
+        avg_area = int(sum(d[2] for d in detections) / len(detections))
+        avg_conf = total_conf / len(detections)
+        
+        logger.info(f'Multi-threshold result: ({avg_cx:.1f},{avg_cy:.1f}), area={avg_area}, confidence={avg_conf:.2f}')
+        return float(avg_cx), float(avg_cy), avg_area, float(avg_conf)
+    
+    # STAGE 3: Iterative fallback - progressively increase tolerance
+    logger.info(f'No multi-threshold match found; trying iterative tolerance increase')
+    for tol in range(color_tolerance + 3, 40, 2):
+        cx, cy, area, conf = detect_color_opencv_hsv(img, target_rgb, tol, min_pixels)
+        if cx is not None and conf >= 0.25:
+            logger.info(f'  Iterative fallback at tolerance {tol}: centroid=({cx:.1f},{cy:.1f}), confidence={conf:.2f}')
+            return float(cx), float(cy), int(area), float(conf)
+    
+    logger.info('No detection found at any tolerance level')
+    return None, None, 0, 0.0
+
+
+def detect_color_pillow_coords(img_p, target_rgb=(255, 0, 0), tol=50, min_pixels=80):
+    """High-accuracy Pillow-based detection using strict RGB matching.
+    Returns (cx, cy, pixels_in_component, confidence) or (None, None, count, 0.0).
+    """
+    from PIL import Image
+    
     w, h = img_p.size
     pixels = img_p.load()
     matched = []
-    best_score = None
-    best_xy = None
+    
     t_r, t_g, t_b = target_rgb
-    tol2 = tol * tol
+    
+    # STRICT threshold for high accuracy - no JPEG compression padding
+    # For tol=20: threshold=40 (very strict), tol=50: threshold=50
+    threshold = max(25, min(80, int(tol * 0.8)))
+    threshold_sq = threshold * threshold
+    
+    logger.info(f'Pillow detection: target RGB {target_rgb}, threshold: {threshold}')
+    
+    # STAGE 1: Exact color matching
     for y in range(h):
         for x in range(w):
-            r, g, b = pixels[x, y]
+            px_val = pixels[x, y]
+            # Handle different image modes
+            if isinstance(px_val, int):
+                r = g = b = px_val
+            elif len(px_val) == 4:  # RGBA
+                r, g, b = px_val[0], px_val[1], px_val[2]
+            else:  # RGB
+                r, g, b = px_val[0], px_val[1], px_val[2]
+            
+            # Euclidean distance
             dr = r - t_r
             dg = g - t_g
             db = b - t_b
-            dist2 = dr*dr + dg*dg + db*db
-            if dist2 <= tol2:
+            dist_sq = dr*dr + dg*dg + db*db
+            
+            if dist_sq <= threshold_sq:
                 matched.append((x, y))
-            if best_score is None or dist2 < best_score:
-                best_score = dist2
-                best_xy = (x, y)
-    total_candidates = len(matched)
-    if total_candidates < min_pixels:
-        # fallback to best single pixel if it's close enough
-        if best_xy and best_score is not None and best_score <= (tol2 / 4):
-            return float(best_xy[0]), float(best_xy[1]), total_candidates, float(max(0.0, 1.0 - best_score / (tol2 or 1)))
-        return None, None, total_candidates, 0.0
-
-    # Connected components (8-neighborhood)
+    
+    # STAGE 2: Validate minimum detection size
+    if len(matched) < min_pixels:
+        logger.info(f'Insufficient matches: {len(matched)} < {min_pixels}')
+        return None, None, len(matched), 0.0
+    
+    # STAGE 3: Connected components with strict validation
     matched_set = set(matched)
     visited = set()
     components = []
     neighs = [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (-1, 1), (1, -1), (1, 1)]
+    
     for px, py in matched:
         if (px, py) in visited:
             continue
-        # BFS/DFS to collect component
-        stack = [(px, py)]
+        
+        # BFS for connected component
+        queue = [(px, py)]
         comp = []
         visited.add((px, py))
-        while stack:
-            cx0, cy0 = stack.pop()
+        
+        while queue:
+            cx0, cy0 = queue.pop(0)
             comp.append((cx0, cy0))
+            
             for dx, dy in neighs:
                 nx, ny = cx0 + dx, cy0 + dy
                 if (nx, ny) in matched_set and (nx, ny) not in visited:
                     visited.add((nx, ny))
-                    stack.append((nx, ny))
-        components.append(comp)
-
+                    queue.append((nx, ny))
+        
+        # Keep only substantial components
+        if len(comp) >= min_pixels * 0.5:
+            components.append(comp)
+    
+    if not components:
+        logger.info('No valid components found')
+        return None, None, len(matched), 0.0
+    
+    # STAGE 4: Select largest component for centroid
     best_comp = max(components, key=len)
     xs = [p[0] for p in best_comp]
     ys = [p[1] for p in best_comp]
     cx = float(sum(xs) / len(xs))
     cy = float(sum(ys) / len(ys))
-    confidence = float(len(best_comp)) / float(total_candidates or 1)
+    confidence = float(len(best_comp)) / float(len(matched))
+    
+    # Flip Y-axis: Y extends upward from bottom
+    cy = h - cy
+    
+    logger.info(f'Component: size={len(best_comp)}, centroid=({cx:.1f},{cy:.1f}), confidence={confidence:.2f}')
     return cx, cy, len(best_comp), confidence
+
+
+def detect_color_multi_threshold_pillow(img_p, target_rgb=(255, 0, 0), tol=50, min_pixels=80):
+    """Multi-threshold Pillow detection with confidence-weighted averaging.
+    Runs detection at multiple threshold levels and averages results weighted by confidence.
+    Falls back to iterative threshold increase if no detection found.
+    Returns (cx, cy, pixels_in_component, confidence) or (None, None, 0, 0.0).
+    """
+    logger.info(f'Starting multi-threshold Pillow detection for RGB {target_rgb}')
+    
+    # Try three threshold levels: base-5, base, base+5
+    threshold_levels = [max(25, tol - 5), tol, min(100, tol + 5)]
+    detections = []
+    
+    # STAGE 1: Multi-threshold detection
+    for threshold in threshold_levels:
+        cx, cy, area, conf = detect_color_pillow_coords(img_p, target_rgb, threshold, min_pixels)
+        if cx is not None and conf >= 0.25:
+            detections.append((cx, cy, area, conf))
+            logger.info(f'  Threshold {threshold}: centroid=({cx:.1f},{cy:.1f}), confidence={conf:.2f}')
+    
+    # STAGE 2: If multi-threshold found results, average them
+    if detections:
+        total_conf = sum(d[3] for d in detections)
+        avg_cx = sum(d[0] * d[3] for d in detections) / total_conf
+        avg_cy = sum(d[1] * d[3] for d in detections) / total_conf
+        avg_area = int(sum(d[2] for d in detections) / len(detections))
+        avg_conf = total_conf / len(detections)
+        
+        logger.info(f'Multi-threshold result: ({avg_cx:.1f},{avg_cy:.1f}), area={avg_area}, confidence={avg_conf:.2f}')
+        return float(avg_cx), float(avg_cy), avg_area, float(avg_conf)
+    
+    # STAGE 3: Iterative fallback - progressively increase threshold
+    logger.info(f'No multi-threshold match found; trying iterative threshold increase')
+    for threshold in range(tol + 10, 100, 5):
+        cx, cy, area, conf = detect_color_pillow_coords(img_p, target_rgb, threshold, min_pixels)
+        if cx is not None and conf >= 0.25:
+            logger.info(f'  Iterative fallback at threshold {threshold}: centroid=({cx:.1f},{cy:.1f}), confidence={conf:.2f}')
+            return float(cx), float(cy), int(area), float(conf)
+    
+    logger.info('No detection found at any threshold level')
+    return None, None, 0, 0.0
 
 # (old detect_red_pillow_coords kept for compatibility)
 def detect_red_pillow_coords(img_p, red_min=150, score_min=15, min_pixels=80):
     return detect_color_pillow_coords(img_p, target_rgb=(255, 0, 0), tol=100, min_pixels=min_pixels)
 
-        stack = [(px, py)]
-        comp = []
-        visited.add((px, py))
-        while stack:
-            x, y = stack.pop()
-            comp.append((x, y))
-            for dx, dy in neighs:
-                nx, ny = x + dx, y + dy
-                if (nx, ny) in red_set and (nx, ny) not in visited:
-                    visited.add((nx, ny))
-                    stack.append((nx, ny))
-        components.append(comp)
 
-    if not components:
-        return None, None, total_candidates, 0.0
 
-    # Choose largest component
-    comp = max(components, key=len)
-    # Try circle fit (Kasa method) if numpy is available for higher robustness to rim-only blobs
-    try:
-        import numpy as _np
-        pts = _np.array(comp, dtype=float)
-        x = pts[:, 0]
-        y = pts[:, 1]
-        A = _np.column_stack((2 * x, 2 * y, _np.ones_like(x)))
-        b = x * x + y * y
-        sol, *_ = _np.linalg.lstsq(A, b, rcond=None)
-        cx = float(sol[0])
-        cy = float(sol[1])
-        confidence = len(comp) / total_candidates if total_candidates else 0.0
-        return float(cx), float(cy), len(comp), float(confidence)
-    except Exception:
-        # fallback: use bounding-box center which is robust to rim-heavy blobs
-        xs = [p[0] for p in comp]
-        ys = [p[1] for p in comp]
-        min_x, max_x = min(xs), max(xs)
-        min_y, max_y = min(ys), max(ys)
-        cx = (min_x + max_x) / 2.0
-        cy = (min_y + max_y) / 2.0
-        confidence = len(comp) / total_candidates if total_candidates else 0.0
-        return float(cx), float(cy), len(comp), float(confidence)
-
+@app.route('/')
+def serve_index():
+    from flask import send_from_directory
+    return send_from_directory(app.static_folder, 'index.html')
 
 @app.route('/health')
 def health():
     return jsonify({'status': 'ok'})
+
+
+@app.route('/extract_first_frame', methods=['POST'])
+def extract_first_frame():
+    """Extract and return the first frame from an uploaded video."""
+    if 'video' not in request.files:
+        return jsonify({'error': 'no file part'}), 400
+    file = request.files['video']
+    if file.filename == '':
+        return jsonify({'error': 'no selected file'}), 400
+    if not allowed_file(file.filename):
+        return jsonify({'error': 'file type not allowed'}), 400
+
+    # Save video temporarily
+    filename = secure_filename(file.filename)
+    timestamp = int(time.time())
+    save_name = f"{timestamp}_{filename}"
+    input_path = os.path.join(UPLOAD_DIR, save_name)
+    file.save(input_path)
+
+    try:
+        # Extract just the first frame
+        with tempfile.TemporaryDirectory(dir=FRAMES_DIR) as temp_frames:
+            out_pattern = os.path.join(temp_frames, 'frame.jpg')
+            ffmpeg_exe = find_ffmpeg()
+            if not ffmpeg_exe:
+                return jsonify({'error': 'ffmpeg not available'}), 500
+            
+            # Use fps=1 and vframes=1 to get only first frame
+            cmd = [ffmpeg_exe, '-y', '-i', input_path, '-vframes', '1', out_pattern]
+            subprocess.run(cmd, check=True, capture_output=True, text=True)
+            
+            # Read the frame
+            frame_path = os.path.join(temp_frames, 'frame.jpg')
+            if not os.path.exists(frame_path):
+                return jsonify({'error': 'frame extraction failed'}), 500
+            
+            with open(frame_path, 'rb') as f:
+                frame_data = f.read()
+            
+            # Convert to base64 for transmission
+            import base64
+            frame_base64 = base64.b64encode(frame_data).decode('utf-8')
+            
+            logger.info(f'Extracted first frame from {filename}')
+            return jsonify({
+                'success': True,
+                'frame': f'data:image/jpeg;base64,{frame_base64}'
+            })
+    
+    except Exception as e:
+        logger.error(f'Error extracting first frame: {e}')
+        return jsonify({'error': str(e)}), 500
+    
+    finally:
+        # Clean up uploaded video
+        try:
+            os.remove(input_path)
+        except:
+            pass
 
 
 @app.route('/upload', methods=['POST'])
@@ -306,186 +767,148 @@ def upload_video():
             return jsonify({'error': 'ffmpeg failed', 'detail': e.stderr}), 500
 
         # Optionally perform color-dot tracking and mark centers on frames
-        # Backwards-compatible support: if track_red is set, default to 'red'.
-        track_color = request.form.get('track_color') or ( 'red' if request.form.get('track_red', '0').lower() in ('1','true','yes','on') else None )
+        track_color = request.form.get('track_color')
         used_detector = 'none'
         markers_count = 0
         detections = {}
-        # Parse color (supports named colors, #rrggbb, and 'r,g,b')
-        target_rgb = parse_color_string(track_color) if track_color else None
-        # allow override of detection params
-        min_pixels = int(request.form.get('min_pixels', 80))
-        tol = int(request.form.get('color_tol', 80))
+        frame_data_list = []  # List to store frame data for CSV
+        frame_number = 0  # Counter for frame numbering
+        
+        # Only track if track_color is provided
+        if track_color:
+            logger.info(f'Received track_color: "{track_color}" (type: {type(track_color).__name__}, len: {len(track_color)})')
+            # Parse color (supports named colors, #rrggbb, and 'r,g,b')
+            target_rgb = parse_color_string(track_color)
+            if not target_rgb:
+                logger.error(f'Failed to parse color: "{track_color}"')
+                return jsonify({'error': 'invalid color format', 'received': str(track_color)}), 400
+            
+            logger.info(f'Parsed color to RGB: {target_rgb}')
+            # Get detection parameters
+            try:
+                min_pixels = int(request.form.get('min_pixels', 80))
+                color_tolerance = int(request.form.get('color_tolerance', 20))
+            except (ValueError, TypeError):
+                min_pixels = 80
+                color_tolerance = 20
+            
+            logger.info(f'Detection params: tolerance={color_tolerance}, min_pixels={min_pixels}')
+            
+            # For Pillow fallback: Convert to strict threshold
+            # tolerance 20 -> tol=40 (very strict), tolerance 50 -> tol=50
+            tol = max(25, min(80, int(color_tolerance * 0.8)))
 
-        min_pixels_req = int(request.form.get('min_pixels', 40))
-        if track_red:
             # Try OpenCV-based detection first (more robust); if not available, use Pillow fallback
             try:
                 import cv2
                 import numpy as np
                 use_cv = True
-                logger.info('Using OpenCV for red tracking')
+                logger.info(f'Using OpenCV for color tracking: {track_color}')
             except Exception:
                 use_cv = False
-                logger.info('OpenCV not available; using Pillow fallback for red tracking')
+                logger.info(f'OpenCV not available; using Pillow fallback for color tracking: {track_color}')
 
-            for fname in os.listdir(temp_frames):
+            for fname in sorted(os.listdir(temp_frames)):
                 if not fname.lower().endswith(('.jpg', '.jpeg', '.png')):
                     continue
                 path = os.path.join(temp_frames, fname)
-                # default no detection
                 detections[fname] = None
+                frame_number += 1  # Increment frame counter
+                frame_time = (frame_number - 1) * interval  # Calculate time for this frame
 
                 if use_cv:
-                    used_detector = 'opencv'
+                    used_detector = 'simple_effective'
                     img = cv2.imread(path)
                     if img is None:
                         continue
-                    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-                    # red can be at low and high hue boundaries
-                    lower1 = np.array([0, 100, 50])
-                    upper1 = np.array([10, 255, 255])
-                    lower2 = np.array([160, 100, 50])
-                    upper2 = np.array([179, 255, 255])
-                    mask1 = cv2.inRange(hsv, lower1, upper1)
-                    mask2 = cv2.inRange(hsv, lower2, upper2)
-                    mask = cv2.bitwise_or(mask1, mask2)
-                    # clean up small noise
-                    kernel = np.ones((3, 3), np.uint8)
-                    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-                    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                    if contours:
-                        c = max(contours, key=cv2.contourArea)
-                        area = cv2.contourArea(c)
-                        # require a minimum area to avoid tiny noisy detections
-                        if area >= 50:
-                            # use minEnclosingCircle for a robust center and radius (subpixel)
-                            (fx, fy), fr = cv2.minEnclosingCircle(c)
-                            cx = float(fx)
-                            cy = float(fy)
-                            r = float(fr)
-                            # draw a filled circle with outline for sharper, crisper marker
-                            radius_px = max(6, int(min(img.shape[0], img.shape[1]) * 0.012))
-                            center_int = (int(round(cx)), int(round(cy)))
-                            # filled circle (semi-solid) then thin outline
-                            cv2.circle(img, center_int, radius_px + 2, (0, 255, 0), thickness=-1, lineType=cv2.LINE_AA)
-                            cv2.circle(img, center_int, radius_px + 2, (0, 192, 0), thickness=1, lineType=cv2.LINE_AA)
-                            cv2.drawMarker(img, center_int, (0, 128, 0), markerType=cv2.MARKER_TILTED_CROSS, thickness=1)
-                            cv2.putText(img, f"({int(round(cx))},{int(round(cy))})", (center_int[0] + 8, center_int[1] - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, lineType=cv2.LINE_AA)
-                            # save with higher JPEG quality when possible
-                            try:
-                                cv2.imwrite(path, img, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
-                            except Exception:
-                                cv2.imwrite(path, img)
-                            markers_count += 1
-                            detections[fname] = {'cx': cx, 'cy': cy, 'area': area, 'radius': r}
+                    
+                    h, w = img.shape[:2]
+                    
+                    # Add video pixel information at top-left corner
+                    resolution_text = f"{w}x{h}"
+                    cv2.putText(img, resolution_text, (5, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1, lineType=cv2.LINE_AA)
+                    
+                    # Use SIMPLE BUT EFFECTIVE detection (fast and reliable)
+                    cx, cy, area, confidence = detect_color_simple_effective(img, target_rgb, color_tolerance, min_pixels)
+                    
+                    # Store frame data
+                    frame_x = round(cx, 1) if cx is not None else None
+                    frame_y = round(cy, 1) if cy is not None else None
+                    frame_data_list.append({
+                        'Frame': frame_number,
+                        'X': frame_x,
+                        'Y': frame_y,
+                        'Time': round(frame_time, 2)
+                    })
+                    
+                    if cx is not None and cy is not None:
+                        # Flip cy back to image coordinates for drawing
+                        cy_draw = h - cy
+                        
+                        # Draw marker on the image
+                        radius_px = max(6, int(min(img.shape[0], img.shape[1]) * 0.012))
+                        center_int = (int(round(cx)), int(round(cy_draw)))
+                        
+                        # Draw circle and cross in contrasting color
+                        cv2.circle(img, center_int, radius_px + 2, (0, 255, 0), thickness=-1, lineType=cv2.LINE_AA)
+                        cv2.circle(img, center_int, radius_px + 2, (0, 192, 0), thickness=1, lineType=cv2.LINE_AA)
+                        cv2.drawMarker(img, center_int, (0, 128, 0), markerType=cv2.MARKER_TILTED_CROSS, thickness=1)
+                        cv2.putText(img, f"({int(round(cx))},{int(round(cy))})", (center_int[0] + 8, center_int[1] - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, lineType=cv2.LINE_AA)
+                        
+                        try:
+                            cv2.imwrite(path, img, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+                        except Exception:
+                            cv2.imwrite(path, img)
+                        
+                        markers_count += 1
+                        detections[fname] = {'cx': cx, 'cy': cy, 'area': area, 'confidence': confidence}
                 else:
                     used_detector = 'pillow'
-                    # Pillow fallback: scan pixels for red-ish colors and compute centroid using clustering
+                    # Pillow fallback using multi-threshold detection
                     try:
                         from PIL import Image, ImageDraw
                     except Exception:
                         continue
+                    
                     img_p = Image.open(path).convert('RGB')
-                    w, h = img_p.size
-                    pixels = img_p.load()
-                    red_pixels = []
-                    best_score = 0
-                    best_xy = None
-                    # thresholds and min pixels (can be tuned via request form)
-                    red_min = int(request.form.get('red_min', 150))
-                    score_min = int(request.form.get('score_min', 25))
-                    min_pixels = int(request.form.get('min_pixels', 80))
-                    confidence = 0.0
-                    for y in range(h):
-                        for x in range(w):
-                            rch, gch, bch = pixels[x, y]
-                            score = rch - max(gch, bch)
-                            if rch > red_min and score > 10:
-                                red_pixels.append((x, y, score))
-                            if score > best_score:
-                                best_score = score
-                                best_xy = (x, y, score)
-                    cx = cy = None
-                    if len(red_pixels) >= min_pixels:
-                        # spatial bucketing with score aggregation to find the most likely blob
-                        bucket_size = max(6, min(w, h) // 150)
-                        buckets = {}
-                        for (x, y, sc) in red_pixels:
-                            key = (x // bucket_size, y // bucket_size)
-                            entry = buckets.setdefault(key, {'count': 0, 'score': 0, 'pixels': []})
-                            entry['count'] += 1
-                            entry['score'] += sc
-                            if len(entry['pixels']) < 500:
-                                entry['pixels'].append((x, y))
-                        # evaluate buckets: prefer those with high average score, sufficient size, and compactness
-                        candidates = []
-                        for k, v in buckets.items():
-                            avg_score = v['score'] / v['count']
-                            pts = v['pixels']
-                            xs = [p[0] for p in pts]
-                            ys = [p[1] for p in pts]
-                            bbox_area = (max(xs) - min(xs) + 1) * (max(ys) - min(ys) + 1) if pts else 1
-                            density = v['count'] / bbox_area if bbox_area > 0 else 0
-                            # metric balances strength, size and compactness
-                            metric = avg_score * density * v['count']
-                            candidates.append((k, v['count'], avg_score, density, metric, pts))
-                        # bias metric toward candidates near the image center (most games keep the subject near center)
-                        cx_img = w / 2.0
-                        cy_img = h / 2.0
-                        weighted = []
-                        for c in candidates:
-                            key, cnt, avg, dens, metric, pts = c
-                            # distance to center
-                            px = int(sum(p[0] for p in pts) / len(pts))
-                            py = int(sum(p[1] for p in pts) / len(pts))
-                            d = ((px - cx_img) ** 2 + (py - cy_img) ** 2) ** 0.5
-                            center_weight = max(0.2, 1.0 - (d / max(w, h)))
-                            weighted_metric = metric * center_weight
-                            weighted.append((weighted_metric, cnt, avg, dens, pts, px, py))
-                        weighted.sort(key=lambda t: t[0], reverse=True)
-                        if weighted:
-                            best = weighted[0]
-                            best_cnt, best_avg, best_density = best[1], best[2], best[3]
-                            pts = best[4]
-                            if best_cnt >= min_pixels and best_avg >= 14 and best_density > 0.01:
-                                cx = int(sum(p[0] for p in pts) / len(pts))
-                                cy = int(sum(p[1] for p in pts) / len(pts))
-                            elif best_cnt >= max(10, min_pixels // 2) and best_avg >= 16 and best_density > 0.005:
-                                cx = int(sum(p[0] for p in pts) / len(pts))
-                                cy = int(sum(p[1] for p in pts) / len(pts))
-                    elif best_xy and best_score > (score_min + 15):
-                        # very strong single-pixel signal fallback (best_xy stores (x,y,score))
-                        cx, cy = best_xy[0], best_xy[1]
-
-                    # Try connected-component detector and prefer its centroid if available
-                    try:
-                        d_cx, d_cy, d_count, d_conf = detect_red_pillow_coords(img_p, red_min=red_min, score_min=score_min, min_pixels=min_pixels)
-                        if d_cx is not None:
-                            cx, cy = d_cx, d_cy
-                            confidence = d_conf
-                    except Exception:
-                        pass
-
+                    w_pil, h_pil = img_p.size
+                    
+                    # Add video pixel information at top-left corner
+                    draw_temp = ImageDraw.Draw(img_p)
+                    resolution_text = f"{w_pil}x{h_pil}"
+                    draw_temp.text((5, 5), resolution_text, fill='yellow')
+                    
+                    cx, cy, pixel_count, confidence = detect_color_multi_threshold_pillow(img_p, target_rgb, tol, min_pixels)
+                    
+                    # Store frame data
+                    frame_x = round(cx, 1) if cx is not None else None
+                    frame_y = round(cy, 1) if cy is not None else None
+                    frame_data_list.append({
+                        'Frame': frame_number,
+                        'X': frame_x,
+                        'Y': frame_y,
+                        'Time': round(frame_time, 2)
+                    })
+                    
                     if cx is not None and cy is not None:
-                        # draw a filled, semi-opaque circle plus a crisp outline using RGBA overlay
-                        radius_px = max(6, int(min(w, h) * 0.012))
-                        img_p_rgba = img_p.convert('RGBA')
-                        overlay = Image.new('RGBA', img_p_rgba.size, (0, 0, 0, 0))
-                        draw = ImageDraw.Draw(overlay)
-                        cx_f = float(cx)
-                        cy_f = float(cy)
-                        cx_i = int(round(cx_f))
-                        cy_i = int(round(cy_f))
-                        draw.ellipse((cx_i - radius_px, cy_i - radius_px, cx_i + radius_px, cy_i + radius_px), fill=(0, 255, 0, 140), outline=(0, 180, 0))
-                        draw.line((cx_i - radius_px, cy_i, cx_i + radius_px, cy_i), fill=(0, 180, 0), width=1)
-                        draw.line((cx_i, cy_i - radius_px, cx_i, cy_i + radius_px), fill=(0, 180, 0), width=1)
-                        draw.text((cx_i + 8, cy_i - 12), f"({cx_i},{cy_i})", fill=(0, 255, 0))
-                        out = Image.alpha_composite(img_p_rgba, overlay).convert('RGB')
-                        # save with higher JPEG quality to reduce compression blur
-                        out.save(path, quality=95)
+                        # Flip cy back to image coordinates for drawing
+                        cy_draw = h_pil - cy
+                        
+                        # Draw marker on PIL image
+                        img_pil = Image.open(path).convert('RGB')
+                        draw = ImageDraw.Draw(img_pil)
+                        
+                        # Add video pixel information at top-left corner
+                        draw.text((5, 5), resolution_text, fill='yellow')
+                        
+                        r = 10
+                        draw.ellipse([(cx-r, cy_draw-r), (cx+r, cy_draw+r)], outline='lime', width=2)
+                        draw.line([(cx-r-5, cy_draw), (cx+r+5, cy_draw)], fill='lime', width=1)
+                        draw.line([(cx, cy_draw-r-5), (cx, cy_draw+r+5)], fill='lime', width=1)
+                        
+                        img_pil.save(path, 'JPEG', quality=95)
                         markers_count += 1
-                        detections[fname] = {'cx': float(cx_f), 'cy': float(cy_f), 'pixels': len(red_pixels), 'confidence': float(confidence)}
+                        detections[fname] = {'cx': float(cx), 'cy': float(cy), 'area': pixel_count, 'confidence': confidence}
 
             # Write per-frame detections (if any) so clients can inspect results
         try:
@@ -495,6 +918,35 @@ def upload_video():
                 json.dump(detections, df, ensure_ascii=False, indent=2)
         except Exception:
             pass
+
+        # Generate CSV data sheet with Frame, X, Y, Time columns
+        # If no color tracking was done, still create CSV with frame numbers and times
+        if not frame_data_list:
+            # Create entries for all extracted frames with None values for X, Y
+            extracted_frames = sorted([f for f in os.listdir(temp_frames) if f.lower().endswith(('.jpg', '.jpeg', '.png'))])
+            for idx, fname in enumerate(extracted_frames):
+                frame_number = idx + 1
+                frame_time = (frame_number - 1) * interval
+                frame_data_list.append({
+                    'Frame': frame_number,
+                    'X': None,
+                    'Y': None,
+                    'Time': round(frame_time, 2)
+                })
+        
+        if frame_data_list:
+            try:
+                import csv
+                csv_path = os.path.join(temp_frames, 'frame_data.csv')
+                with open(csv_path, 'w', newline='', encoding='utf-8') as csvfile:
+                    fieldnames = ['Frame', 'X', 'Y', 'Time']
+                    writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                    writer.writeheader()
+                    for row in frame_data_list:
+                        writer.writerow(row)
+                logger.info(f'Generated CSV with {len(frame_data_list)} frame entries')
+            except Exception as e:
+                logger.error(f'Error generating CSV: {e}')
 
         # Zip the frames
         zip_base = os.path.join(UPLOAD_DIR, f"frames_{timestamp}")
@@ -523,9 +975,20 @@ def upload_video():
 
 @app.route('/demo', methods=['POST', 'GET'])
 def demo():
-    # Create a short test video (1s) with a moving colored square (color from query), run processing, and return frames.zip
-    color_param = request.args.get('color') or request.args.get('track_color') or 'red'
+    # Create a short test video (1s) with a moving colored square (color from query/form), run processing, and return frames.zip
+    color_param = request.form.get('track_color') or request.args.get('color') or request.args.get('track_color') or 'red'
     target_rgb = parse_color_string(color_param) or (255, 0, 0)
+    
+    # Get detection parameters
+    try:
+        min_pixels = int(request.form.get('min_pixels', 80))
+        color_tolerance = int(request.form.get('color_tolerance', 20))
+    except (ValueError, TypeError):
+        min_pixels = 80
+        color_tolerance = 20
+    
+    tol = max(25, min(80, int(color_tolerance * 0.8)))
+    
     with tempfile.TemporaryDirectory(dir=FRAMES_DIR) as tmpd:
         video_path = os.path.join(tmpd, 'demo.mp4')
         # Generate frames and encode with ffmpeg
@@ -564,101 +1027,56 @@ def demo():
         # run tracking like above
         used_detector = 'none'
         markers_count = 0
+        detections = {}
         try:
             import cv2
             import numpy as np
             use_cv = True
         except Exception:
             use_cv = False
+        
         for fname in os.listdir(tmpd):
             if not fname.lower().endswith(('.jpg', '.jpeg', '.png')):
                 continue
             path = os.path.join(tmpd, fname)
+            detections[fname] = None
+            
             if use_cv and target_rgb is not None:
-                used_detector = 'opencv'
+                used_detector = 'simple_effective'
                 img = cv2.imread(path)
                 if img is None:
                     continue
-                hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-                ranges = hsv_ranges_for_rgb(target_rgb)
-                mask = None
-                for (low, high) in ranges:
-                    low_arr = np.array(low, dtype=np.uint8)
-                    high_arr = np.array(high, dtype=np.uint8)
-                    m = cv2.inRange(hsv, low_arr, high_arr)
-                    if mask is None:
-                        mask = m
-                    else:
-                        mask = cv2.bitwise_or(mask, m)
-                if mask is None:
-                    continue
-                kernel = np.ones((3, 3), np.uint8)
-                mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-                contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                if contours:
-                    c = max(contours, key=cv2.contourArea)
-                    M = cv2.moments(c)
-                    if M.get('m00', 0):
-                        cx = int(M['m10'] / M['m00'])
-                        cy = int(M['m01'] / M['m00'])
-                        cv2.circle(img, (cx, cy), 6, (0, 255, 0), 2, lineType=cv2.LINE_AA)
-                        cv2.drawMarker(img, (cx, cy), (0, 255, 0), markerType=cv2.MARKER_CROSS, thickness=1)
-                        cv2.putText(img, f"({cx},{cy})", (cx + 8, cy - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
-                        cv2.imwrite(path, img)
-                        markers_count += 1
+                
+                # Use SIMPLE BUT EFFECTIVE detection (fast and reliable)
+                cx, cy, area, confidence = detect_color_simple_effective(img, target_rgb, color_tolerance, min_pixels)
+                
+                if cx is not None and cy is not None:
+                    radius_px = 6
+                    center_int = (int(round(cx)), int(round(cy)))
+                    cv2.circle(img, center_int, radius_px + 2, (0, 255, 0), thickness=-1, lineType=cv2.LINE_AA)
+                    cv2.circle(img, center_int, radius_px + 2, (0, 192, 0), thickness=1, lineType=cv2.LINE_AA)
+                    cv2.drawMarker(img, center_int, (0, 128, 0), markerType=cv2.MARKER_TILTED_CROSS, thickness=1)
+                    cv2.putText(img, f"({int(round(cx))},{int(round(cy))})", (center_int[0] + 8, center_int[1] - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, lineType=cv2.LINE_AA)
+                    cv2.imwrite(path, img)
+                    markers_count += 1
+                    detections[fname] = {'cx': cx, 'cy': cy, 'area': area, 'confidence': confidence}
             elif target_rgb is not None:
                 used_detector = 'pillow'
                 from PIL import Image, ImageDraw
                 img_p = Image.open(path).convert('RGB')
-                cx, cy, count, conf = detect_color_pillow_coords(img_p, target_rgb=target_rgb, tol=tol, min_pixels=min_pixels)
+                cx, cy, count, conf = detect_color_multi_threshold_pillow(img_p, target_rgb, tol, min_pixels)
                 if cx is not None and cy is not None:
                     draw = ImageDraw.Draw(img_p)
                     radius = 6
                     draw.ellipse((cx - radius, cy - radius, cx + radius, cy + radius), outline=(0, 255, 0), width=2)
                     draw.line((cx - 8, cy, cx + 8, cy), fill=(0, 255, 0), width=1)
                     draw.line((cx, cy - 8, cx, cy + 8), fill=(0, 255, 0), width=1)
-                    draw.text((cx + 8, cy - 12), f"({int(cx)},{int(cy)})", fill=(0, 255, 0))
                     img_p.save(path)
                     markers_count += 1
-            else:
-                used_detector = 'pillow'
-                from PIL import Image, ImageDraw
-                img_p = Image.open(path).convert('RGB')
-                w, h = img_p.size
-                pixels = img_p.load()
-                xs = []
-                ys = []
-                best_score = 0
-                best_xy = None
-                for y in range(h):
-                    for x in range(w):
-                        r, g, b = pixels[x, y]
-                        score = r - max(g, b)
-                        if r > 100 and score > 10:
-                            xs.append(x)
-                            ys.append(y)
-                        if score > best_score:
-                            best_score = score
-                            best_xy = (x, y)
-                if xs and ys:
-                    cx = int(sum(xs) / len(xs))
-                    cy = int(sum(ys) / len(ys))
-                elif best_xy and best_score > 15:
-                    cx, cy = best_xy
-                else:
-                    cx = cy = None
-                if cx is not None and cy is not None:
-                    draw = ImageDraw.Draw(img_p)
-                    radius = 6
-                    draw.ellipse((cx - radius, cy - radius, cx + radius, cy + radius), outline=(0, 255, 0), width=2)
-                    draw.line((cx - 8, cy, cx + 8, cy), fill=(0, 255, 0), width=1)
-                    draw.line((cx, cy - 8, cx, cy + 8), fill=(0, 255, 0), width=1)
-                    draw.text((cx + 8, cy - 12), f"({cx},{cy})", fill=(0, 255, 0))
-                    img_p.save(path)
-                    markers_count += 1
+                    detections[fname] = {'cx': float(cx), 'cy': float(cy), 'area': count, 'confidence': conf}
 
+        # Create zip archive with frames
         zip_base = os.path.join(UPLOAD_DIR, f"demo_{int(time.time())}")
-        # Create a frames-only directory so the zip contains only the extracted frames (no source pngs folder)
         frames_only = os.path.join(tmpd, 'frames_only')
         os.makedirs(frames_only, exist_ok=True)
         for f in os.listdir(tmpd):
@@ -666,12 +1084,13 @@ def demo():
                 shutil.copy(os.path.join(tmpd, f), os.path.join(frames_only, f))
         zip_path = shutil.make_archive(zip_base, 'zip', frames_only)
         frames_count = sum(1 for f in os.listdir(frames_only) if f.lower().endswith(('.jpg', '.jpeg', '.png')))
-        logger.info('Demo produced %s frames in %s (archived from %s)', frames_count, tmpd, frames_only)
+        logger.info('Demo produced %s frames in %s with %s markers', frames_count, tmpd, markers_count)
+        
         headers = {
             'X-Frames-Count': str(frames_count),
             'X-Markers-Count': str(markers_count),
             'X-Used-Detector': used_detector,
-            'X-Track-Color': (track_color or '')
+            'X-Track-Color': color_param
         }
         resp = send_file(zip_path, as_attachment=True)
         resp.headers.update(headers)
